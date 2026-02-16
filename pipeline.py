@@ -42,6 +42,8 @@ INDEX_TYPE = os.environ.get("INDEX_TYPE", "ivfpq")
 NLIST = int(os.environ.get("NLIST", "1024"))
 M = int(os.environ.get("M", "32"))
 NBITS = int(os.environ.get("NBITS", "8"))
+TRAIN_SAMPLES = int(os.environ.get("TRAIN_SAMPLES", "1000000"))
+NITER = int(os.environ.get("NITER", "100"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -373,8 +375,12 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     quantizer = faiss.IndexFlatIP(FEATURE_DIM)
     index = faiss.IndexIVFPQ(quantizer, FEATURE_DIM, nlist, M, NBITS, metric)
 
+    # Set clustering iterations (default FAISS is 25, we use 100 for better quality)
+    index.cp.niter = NITER
+    print(f"  Clustering iterations (niter): {NITER}")
+
     # Training
-    train_samples = min(n_vectors, 1_000_000)
+    train_samples = min(n_vectors, TRAIN_SAMPLES)
     print(f"\nSampling {train_samples:,} vectors for training...")
     reporter.report("index", f"Sampling {train_samples:,} training vectors", 5)
 
