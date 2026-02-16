@@ -237,9 +237,21 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
     print(f"\nCreating merged memmap: {merged_features_path}")
     reporter.report("merge", "Creating merged feature file", 0)
 
-    merged = np.lib.format.open_memmap(
-        str(merged_features_path), mode='w+', dtype='float32',
-        shape=(total_rows, FEATURE_DIM)
+    # Write a valid .npy header then create a memmap over it
+    # (avoids np.lib.format.open_memmap which breaks on NumPy 2.x)
+    with open(str(merged_features_path), 'wb') as _hf:
+        np.lib.format.write_array_header_2_0(
+            _hf, {'descr': np.dtype('float32').str,
+                   'fortran_order': False,
+                   'shape': (total_rows, FEATURE_DIM)})
+        header_len = _hf.tell()
+        # Extend file to full size
+        _hf.seek(header_len + total_rows * FEATURE_DIM * 4 - 1)
+        _hf.write(b'\x00')
+
+    merged = np.memmap(
+        str(merged_features_path), dtype='float32', mode='r+',
+        offset=header_len, shape=(total_rows, FEATURE_DIM)
     )
 
     # Copy features

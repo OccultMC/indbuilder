@@ -1,5 +1,5 @@
 # VPS Builder Worker Dependencies
-numpy>=1.24.0
+numpy>=1.24.0,<2.0
 boto3>=1.28.0
 rich>=14.0.0
 
