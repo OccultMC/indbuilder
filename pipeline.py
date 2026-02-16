@@ -232,26 +232,14 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
     if free_gb < total_size_gb * 1.5:
         print(f"[WARN] Low disk space! Need ~{total_size_gb * 1.5:.1f} GB, have {free_gb:.1f} GB")
 
-    # Create merged memmap
-    merged_features_path = WORK_DIR / "features.npy"
+    # Create merged memmap as raw binary (no .npy header — avoids all np.lib.format issues)
+    merged_features_path = WORK_DIR / "features.bin"
     print(f"\nCreating merged memmap: {merged_features_path}")
     reporter.report("merge", "Creating merged feature file", 0)
 
-    # Write a valid .npy header then create a memmap over it
-    # (avoids np.lib.format.open_memmap which breaks on NumPy 2.x)
-    with open(str(merged_features_path), 'wb') as _hf:
-        np.lib.format.write_array_header_2_0(
-            _hf, {'descr': np.dtype('float32').str,
-                   'fortran_order': False,
-                   'shape': (total_rows, FEATURE_DIM)})
-        header_len = _hf.tell()
-        # Extend file to full size
-        _hf.seek(header_len + total_rows * FEATURE_DIM * 4 - 1)
-        _hf.write(b'\x00')
-
     merged = np.memmap(
-        str(merged_features_path), dtype='float32', mode='r+',
-        offset=header_len, shape=(total_rows, FEATURE_DIM)
+        str(merged_features_path), dtype='float32', mode='w+',
+        shape=(total_rows, FEATURE_DIM)
     )
 
     # Copy features
@@ -346,38 +334,19 @@ def build_faiss_index(features_path: Path, n_vectors: int,
 
     row_bytes = FEATURE_DIM * 4  # float32
 
-    def _read_npy_header(f):
-        """Read .npy header and return data offset, compatible with all NumPy versions."""
-        f.seek(0)
-        version = np.lib.format.read_magic(f)
-        # Use public read_array_header_1_0 / 2_0 based on version tuple
-        if version[0] == 1:
-            shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
-        else:
-            shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
-        return f.tell()
+    # Memory-map the raw binary features file (no .npy header to parse)
+    features_mmap = np.memmap(
+        str(features_path), dtype='float32', mode='r',
+        shape=(n_vectors, FEATURE_DIM)
+    )
 
     def read_features_slice(start_row, end_row):
-        """Read a slice of features directly from the .npy file."""
-        n_rows = end_row - start_row
-        with open(str(features_path), 'rb') as f:
-            data_offset = _read_npy_header(f)
-            f.seek(data_offset + start_row * row_bytes)
-            raw = f.read(n_rows * row_bytes)
-            result = np.frombuffer(raw, dtype=np.float32).reshape(n_rows, FEATURE_DIM).copy()
-        return result
+        """Read a slice of features from the memmap."""
+        return np.array(features_mmap[start_row:end_row], dtype=np.float32)
 
     def read_features_by_indices(indices):
-        """Read specific rows by index from the .npy file."""
-        n_rows = len(indices)
-        result = np.empty((n_rows, FEATURE_DIM), dtype=np.float32)
-        with open(str(features_path), 'rb') as f:
-            data_offset = _read_npy_header(f)
-            for i, idx in enumerate(indices):
-                f.seek(data_offset + int(idx) * row_bytes)
-                raw = f.read(row_bytes)
-                result[i] = np.frombuffer(raw, dtype=np.float32)
-        return result
+        """Read specific rows by index from the memmap."""
+        return np.array(features_mmap[indices], dtype=np.float32)
 
     # Auto-adjust nlist if needed
     nlist = NLIST
@@ -458,7 +427,7 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         'nbits': NBITS,
         'index_file': 'megaloc.index',
         'metadata_file': 'metadata.json',
-        'features_file': 'features.npy',
+        'features_file': 'features.bin',
     }
     config_path = WORK_DIR / "config.json"
     with open(config_path, 'w', encoding='utf-8') as f:
