@@ -6,7 +6,7 @@ ENV PYTHONPATH=/app
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl dos2unix && \
+    build-essential curl dos2unix openssh-client openssh-server && \
     rm -rf /var/lib/apt/lists/*
 
 # Install vastai CLI for self-destruct
