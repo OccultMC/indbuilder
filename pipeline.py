@@ -534,6 +534,27 @@ def _detect_instance_id(r2: R2Client, features_prefix: str) -> str:
     return ""
 
 
+def upload_logs(r2: R2Client, features_prefix: str, log_path: Path):
+    """Upload the full instance log to R2."""
+    if not log_path.exists():
+        print("[WARN] No log file to upload")
+        return
+
+    r2_key = f"Logs/{'/'.join(features_prefix.rstrip('/').split('/')[1:])}/builder.log"
+    size_mb = log_path.stat().st_size / (1024 * 1024)
+    print(f"Uploading instance log ({size_mb:.2f} MB) -> {r2_key}")
+
+    for attempt in range(3):
+        success = r2.upload_file(str(log_path), r2_key)
+        if success:
+            print(f"Log uploaded to {r2_key}")
+            return
+        print(f"[RETRY] Log upload attempt {attempt+1} failed")
+        time.sleep(2 ** attempt)
+
+    print("[WARN] Failed to upload log after 3 attempts")
+
+
 def self_destruct(r2: R2Client, features_prefix: str):
     """Destroy this instance via vastai CLI."""
     api_key = os.environ.get("VAST_API_KEY", "")
@@ -566,7 +587,50 @@ def self_destruct(r2: R2Client, features_prefix: str):
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _LogTee:
+    """Tee stdout/stderr to a log file while preserving console output."""
+
+    def __init__(self, log_path: Path):
+        self.log_file = open(str(log_path), 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+
+    def start(self):
+        sys.stdout = self._TeeStream(self.stdout, self.log_file)
+        sys.stderr = self._TeeStream(self.stderr, self.log_file)
+
+    def stop(self):
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
+        self.log_file.close()
+
+    class _TeeStream:
+        def __init__(self, original, log_file):
+            self.original = original
+            self.log_file = log_file
+
+        def write(self, data):
+            self.original.write(data)
+            try:
+                self.log_file.write(data)
+                self.log_file.flush()
+            except Exception:
+                pass
+
+        def flush(self):
+            self.original.flush()
+            try:
+                self.log_file.flush()
+            except Exception:
+                pass
+
+
 def main():
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = WORK_DIR / "builder.log"
+    tee = _LogTee(log_path)
+    tee.start()
+
     print("=" * 80)
     print("  VPS BUILDER PIPELINE — Feature Merge + FAISS Index")
     print("=" * 80)
@@ -578,8 +642,6 @@ def main():
     print(f"Features prefix: {features_prefix}")
     print(f"City: {city_name}")
     print(f"Work dir: {WORK_DIR}")
-
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
 
     # Init R2
     r2 = R2Client()
@@ -614,12 +676,20 @@ def main():
         print(f"\n[FATAL] Pipeline failed: {e}")
         import traceback
         traceback.print_exc()
-        # Keep container alive for debugging
+
+        # Upload log before pausing
+        tee.stop()
+        upload_logs(r2, features_prefix, log_path)
+
         print("[INFO] Container kept alive for debugging. SSH in to investigate.")
         sys.stdout.flush()
         import signal
         signal.pause()
         return
+
+    # Upload full instance log
+    tee.stop()
+    upload_logs(r2, features_prefix, log_path)
 
     # Step 6: Self-destruct
     self_destruct(r2, features_prefix)
