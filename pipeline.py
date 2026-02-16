@@ -22,11 +22,12 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-# Fix OpenMP conflict
+# Fix OpenMP conflict — use all available cores
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
+_ncpu = str(os.cpu_count() or 4)
+os.environ["OMP_NUM_THREADS"] = _ncpu
+os.environ["OPENBLAS_NUM_THREADS"] = _ncpu
+os.environ["MKL_NUM_THREADS"] = _ncpu
 
 from r2_storage import R2Client
 
@@ -651,6 +652,7 @@ def main():
     print(f"Features prefix: {features_prefix}")
     print(f"City: {city_name}")
     print(f"Work dir: {WORK_DIR}")
+    print(f"CPU cores: {os.cpu_count()} (OMP_NUM_THREADS={_ncpu})")
 
     # Init R2
     r2 = R2Client()
