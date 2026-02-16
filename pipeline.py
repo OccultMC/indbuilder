@@ -334,15 +334,22 @@ def build_faiss_index(features_path: Path, n_vectors: int,
 
     row_bytes = FEATURE_DIM * 4  # float32
 
+    def _read_npy_header(f):
+        """Read .npy header and return data offset, compatible with all NumPy versions."""
+        f.seek(0)
+        version = np.lib.format.read_magic(f)
+        # Use public read_array_header_1_0 / 2_0 based on version tuple
+        if version[0] == 1:
+            shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+        else:
+            shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
+        return f.tell()
+
     def read_features_slice(start_row, end_row):
         """Read a slice of features directly from the .npy file."""
         n_rows = end_row - start_row
         with open(str(features_path), 'rb') as f:
-            f.seek(0)
-            version = np.lib.format.read_magic(f)
-            np.lib.format._check_version(version)
-            shape, fortran, dtype = np.lib.format._read_array_header(f, version)
-            data_offset = f.tell()
+            data_offset = _read_npy_header(f)
             f.seek(data_offset + start_row * row_bytes)
             raw = f.read(n_rows * row_bytes)
             result = np.frombuffer(raw, dtype=np.float32).reshape(n_rows, FEATURE_DIM).copy()
@@ -353,10 +360,7 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         n_rows = len(indices)
         result = np.empty((n_rows, FEATURE_DIM), dtype=np.float32)
         with open(str(features_path), 'rb') as f:
-            version = np.lib.format.read_magic(f)
-            np.lib.format._check_version(version)
-            shape, fortran, dtype = np.lib.format._read_array_header(f, version)
-            data_offset = f.tell()
+            data_offset = _read_npy_header(f)
             for i, idx in enumerate(indices):
                 f.seek(data_offset + int(idx) * row_bytes)
                 raw = f.read(row_bytes)
