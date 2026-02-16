@@ -357,12 +357,21 @@ def build_faiss_index(features_path: Path, n_vectors: int,
 
     # Create index with Inner Product metric
     metric = faiss.METRIC_INNER_PRODUCT
-    quantizer = faiss.IndexFlatIP(FEATURE_DIM)
-    index = faiss.IndexIVFPQ(quantizer, FEATURE_DIM, nlist, M, NBITS, metric)
 
-    # Set clustering iterations (default FAISS is 25, we use 100 for better quality)
-    index.cp.niter = NITER
-    print(f"  Clustering iterations (niter): {NITER}")
+    if INDEX_TYPE == "ivfpq":
+        quantizer = faiss.IndexFlatIP(FEATURE_DIM)
+        index = faiss.IndexIVFPQ(quantizer, FEATURE_DIM, nlist, M, NBITS, metric)
+        index.cp.niter = NITER
+        index.cp.verbose = True  # Log clustering progress
+        print(f"  Index: IVFPQ, nlist={nlist}, m={M}, nbits={NBITS}, niter={NITER}")
+    elif INDEX_TYPE == "pq":
+        index = faiss.IndexPQ(FEATURE_DIM, M, NBITS, metric)
+        print(f"  Index: PQ, m={M}, nbits={NBITS}")
+    else:
+        raise ValueError(f"Unknown INDEX_TYPE: {INDEX_TYPE}")
+
+    # Enable FAISS verbose output for training progress
+    index.verbose = True
 
     # Training
     train_samples = min(n_vectors, TRAIN_SAMPLES)
@@ -377,19 +386,29 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     train_data = read_features_by_indices(train_indices)
     faiss.normalize_L2(train_data)
     print(f"Training data loaded: {train_data.nbytes / (1024 ** 2):.0f} MB")
+    sys.stdout.flush()
 
-    print("Training index...")
-    reporter.report("index", "Training FAISS index", 15)
+    print(f"Training index ({INDEX_TYPE}) — this may take a while...")
+    print(f"  {train_samples:,} vectors x {FEATURE_DIM} dim, {M} sub-quantizers")
+    sys.stdout.flush()
+    reporter.report("index", f"Training {INDEX_TYPE} index ({train_samples:,} vectors)", 15)
+
+    train_start = time.time()
     index.train(train_data)
+    train_elapsed = time.time() - train_start
+
     del train_data
     gc.collect()
-    print("Training complete.")
+    print(f"Training complete in {train_elapsed:.1f}s ({train_elapsed/60:.1f} min)")
+    sys.stdout.flush()
+    reporter.report("index", f"Training done ({train_elapsed/60:.1f} min)", 20)
 
     # Adding vectors
     add_batch_size = 10_000
     total_batches = (n_vectors + add_batch_size - 1) // add_batch_size
-    print(f"\nAdding {n_vectors:,} vectors in batches of {add_batch_size:,}...")
-    reporter.report("index", "Adding vectors", 20)
+    print(f"\nAdding {n_vectors:,} vectors in batches of {add_batch_size:,} ({total_batches} batches)...")
+    reporter.report("index", "Adding vectors", 25)
+    add_start = time.time()
 
     for batch_idx, start in enumerate(range(0, n_vectors, add_batch_size)):
         end = min(start + add_batch_size, n_vectors)
@@ -398,9 +417,18 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         index.add(batch)
         del batch
 
-        if (batch_idx + 1) % 100 == 0:
-            pct = 20 + int(batch_idx / total_batches * 70)
-            reporter.report("index", f"Added {end:,}/{n_vectors:,} vectors", pct)
+        # Log every batch
+        elapsed = time.time() - add_start
+        pct = 25 + int((batch_idx + 1) / total_batches * 65)
+        if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == total_batches:
+            rate = end / elapsed if elapsed > 0 else 0
+            eta = (n_vectors - end) / rate if rate > 0 else 0
+            print(f"  Batch {batch_idx+1}/{total_batches}: {end:,}/{n_vectors:,} vectors "
+                  f"({elapsed:.0f}s elapsed, {rate:.0f} vec/s, ETA {eta:.0f}s)")
+            sys.stdout.flush()
+            reporter.report("index", f"Added {end:,}/{n_vectors:,} vectors (ETA {eta/60:.1f}m)", pct)
+
+        if (batch_idx + 1) % 10 == 0:
             gc.collect()
 
     print(f"Index built with {index.ntotal} vectors")
