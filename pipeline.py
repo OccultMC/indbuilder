@@ -37,11 +37,11 @@ from r2_storage import R2Client
 FEATURE_DIM = 8448  # MegaLoc feature dimension
 WORK_DIR = Path("/app/work")
 
-# FAISS index defaults
-INDEX_TYPE = "ivfpq"
-NLIST = 1024
-M = 32
-NBITS = 8
+# FAISS index settings (overridable via env vars)
+INDEX_TYPE = os.environ.get("INDEX_TYPE", "ivfpq")
+NLIST = int(os.environ.get("NLIST", "1024"))
+M = int(os.environ.get("M", "32"))
+NBITS = int(os.environ.get("NBITS", "8"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
