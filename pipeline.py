@@ -14,11 +14,12 @@ Progress is logged to stdout in structured format:
 import gc
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -102,6 +103,31 @@ class StatusReporter:
 # Step 1: Discover feature files on R2
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _parse_worker_npy(key: str) -> Optional[Tuple[int, int]]:
+    """
+    Parse worker_index and total_workers from a .npy key.
+
+    Expected filename suffix: {city}_{worker_index}.{total_workers}.npy
+    Returns (worker_index, total_workers) or None if the pattern doesn't match.
+    """
+    m = re.search(r'_(\d+)\.(\d+)\.npy$', key)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _parse_worker_jsonl(key: str) -> Optional[Tuple[int, int]]:
+    """
+    Parse worker_index and total_workers from a Metadata .jsonl key.
+
+    Expected filename suffix: Metadata_{city}_{worker_index}.{total_workers}.jsonl
+    """
+    m = re.search(r'_(\d+)\.(\d+)\.jsonl$', key)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
 def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str], List[str]]:
     """
     List all .npy and .jsonl files under the features prefix.
@@ -109,6 +135,11 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
     VPS_Pipeline uploads:
       Features/{country}/{state}/{city}/{city}_{worker}.{total}.npy
       Features/{country}/{state}/{city}/Metadata_{city}_{worker}.{total}.jsonl
+
+    Files are returned sorted by worker index (ascending) so that the merge
+    step produces a deterministic, ordered output regardless of R2 list order.
+    Missing workers are reported as warnings; the builder continues with
+    whatever files are present.
     """
     print(f"\n{'='*80}")
     print("STEP 1: Discovering feature files on R2")
@@ -116,16 +147,77 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
     print(f"Prefix: {features_prefix}")
 
     all_files = r2.list_files(features_prefix)
+    size_map = {f['key']: f['size'] for f in all_files}
 
-    npy_files = sorted([f['key'] for f in all_files if f['key'].endswith('.npy')])
-    jsonl_files = sorted([f['key'] for f in all_files if f['key'].endswith('.jsonl')])
+    raw_npy   = [f['key'] for f in all_files if f['key'].endswith('.npy')]
+    raw_jsonl = [f['key'] for f in all_files if f['key'].endswith('.jsonl')]
 
-    print(f"Found {len(npy_files)} feature files (.npy)")
+    # ── Detect worker count from .npy filenames ──────────────────────────────
+    npy_by_worker: Dict[int, str] = {}   # worker_index -> key
+    detected_total: Optional[int] = None
+    inconsistent_totals: list = []
+
+    for key in raw_npy:
+        parsed = _parse_worker_npy(key)
+        if parsed is None:
+            print(f"  [WARN] Unrecognised .npy filename (skipping): {key}")
+            continue
+        w_idx, w_total = parsed
+        if detected_total is None:
+            detected_total = w_total
+        elif w_total != detected_total:
+            inconsistent_totals.append((key, w_total))
+        npy_by_worker[w_idx] = key
+
+    if inconsistent_totals:
+        print(f"[WARN] Inconsistent total_workers across .npy files:")
+        for key, t in inconsistent_totals:
+            print(f"  {key} has total={t}, expected {detected_total}")
+
+    if detected_total is not None:
+        print(f"\nDetected NUM_WORKERS from filenames: {detected_total}")
+        present_workers = sorted(npy_by_worker.keys())
+        missing_workers = [i for i in range(1, detected_total + 1)
+                           if i not in npy_by_worker]
+        print(f"Workers present : {present_workers} ({len(present_workers)}/{detected_total})")
+        if missing_workers:
+            print(f"[WARN] Missing worker files for indices: {missing_workers}")
+            print(f"[WARN] Builder will merge only the {len(present_workers)} available workers.")
+        else:
+            print("All workers accounted for — proceeding with merge.")
+    else:
+        print("[WARN] Could not detect worker count from .npy filenames.")
+
+    # Sort .npy files by worker index; fall back to lexicographic for unknowns
+    npy_files = [npy_by_worker[i] for i in sorted(npy_by_worker.keys())]
+
+    # ── Match .jsonl files by worker index ───────────────────────────────────
+    jsonl_by_worker: Dict[int, str] = {}
+    for key in raw_jsonl:
+        parsed = _parse_worker_jsonl(key)
+        if parsed is None:
+            print(f"  [WARN] Unrecognised .jsonl filename (skipping): {key}")
+            continue
+        w_idx, _ = parsed
+        jsonl_by_worker[w_idx] = key
+
+    # Only keep jsonl files whose worker index has a matching .npy
+    jsonl_files = [jsonl_by_worker[i] for i in sorted(npy_by_worker.keys())
+                   if i in jsonl_by_worker]
+
+    missing_jsonl = [i for i in sorted(npy_by_worker.keys())
+                     if i not in jsonl_by_worker]
+    if missing_jsonl:
+        print(f"[WARN] Missing metadata (.jsonl) for worker indices: {missing_jsonl}")
+
+    print(f"\nFound {len(npy_files)} feature files (.npy)")
     print(f"Found {len(jsonl_files)} metadata files (.jsonl)")
 
-    for f in npy_files:
-        size_mb = next((x['size'] for x in all_files if x['key'] == f), 0) / (1024 * 1024)
-        print(f"  {f} ({size_mb:.1f} MB)")
+    for key in npy_files:
+        size_mb = size_map.get(key, 0) / (1024 * 1024)
+        parsed = _parse_worker_npy(key)
+        tag = f"worker {parsed[0]}/{parsed[1]}" if parsed else "unknown worker"
+        print(f"  [{tag}] {key} ({size_mb:.1f} MB)")
 
     if not npy_files:
         print("[FATAL] No feature files found!")
@@ -223,15 +315,24 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
 
     print(f"\nTotal vectors to merge: {total_rows:,}")
     total_size_gb = total_rows * FEATURE_DIM * 4 / (1024 ** 3)
+    per_worker_gb = total_size_gb / len(npy_paths) if npy_paths else 0
     print(f"Merged file size: {total_size_gb:.2f} GB")
+    print(f"Per-worker avg:   {per_worker_gb:.2f} GB")
 
-    # Check disk space
+    # Disk check — using streaming-delete strategy:
+    # features.bin is a sparse file (blocks allocated only as written), and each
+    # source .npy is deleted immediately after its data is copied in.  Peak extra
+    # disk needed is therefore ~1 worker file, not the full merged size.
     import shutil
     disk_usage = shutil.disk_usage(str(WORK_DIR))
     free_gb = disk_usage.free / (1024 ** 3)
-    print(f"Disk free: {free_gb:.1f} GB")
-    if free_gb < total_size_gb * 1.5:
-        print(f"[WARN] Low disk space! Need ~{total_size_gb * 1.5:.1f} GB, have {free_gb:.1f} GB")
+    needed_gb = per_worker_gb + 5  # 1 worker buffer + 5 GB headroom
+    print(f"Disk free: {free_gb:.1f} GB  (need ~{needed_gb:.1f} GB with streaming-delete)")
+    if free_gb < needed_gb:
+        print(f"[FATAL] Not enough free disk even for one worker slice "
+              f"({needed_gb:.1f} GB needed, {free_gb:.1f} GB free). "
+              f"Provision at least {total_size_gb + per_worker_gb + 20:.0f} GB total disk.")
+        sys.exit(1)
 
     # Create merged memmap as raw binary (no .npy header — avoids all np.lib.format issues)
     merged_features_path = WORK_DIR / "features.bin"
@@ -262,8 +363,17 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
         del src
         gc.collect()
 
-        if (i + 1) % 2 == 0:
-            merged.flush()
+        # Delete the source file now that it's safely in features.bin.
+        # features.bin is a sparse file so its blocks were only allocated as
+        # we wrote them — freeing the source keeps peak disk near the input size.
+        worker_size_gb = n_rows * FEATURE_DIM * 4 / (1024 ** 3)
+        try:
+            npy_path.unlink()
+            print(f"  [DISK] Freed {worker_size_gb:.2f} GB — deleted {npy_path.name}")
+        except OSError as e:
+            print(f"  [WARN] Could not delete {npy_path.name}: {e}")
+
+        merged.flush()
 
     merged.flush()
     del merged
