@@ -65,11 +65,17 @@ def get_env(key: str, default: str = None) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class StatusReporter:
-    """Reports progress to R2 and stdout."""
+    """Reports progress to R2 and stdout.
 
-    def __init__(self, r2: R2Client, status_prefix: str):
+    Status key format: Status/INDEX_{city_name}_{instance_id}.json
+    Flat structure avoids location-nested paths.
+    """
+
+    def __init__(self, r2: R2Client, city_name: str, instance_id: str):
         self.r2 = r2
-        self.status_key = f"Status/{status_prefix}/builder.json"
+        self.city_name = city_name
+        self.instance_id = instance_id
+        self.status_key = f"Status/INDEX_{city_name}_{instance_id}.json"
         self.start_time = time.time()
         self._last_report = 0
 
@@ -495,7 +501,6 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     print("Reading training vectors from disk...")
     reporter.report("index", "Reading training data", 10)
     train_data = read_features_by_indices(train_indices)
-    faiss.normalize_L2(train_data)
     print(f"Training data loaded: {train_data.nbytes / (1024 ** 2):.0f} MB")
     sys.stdout.flush()
 
@@ -524,7 +529,6 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     for batch_idx, start in enumerate(range(0, n_vectors, add_batch_size)):
         end = min(start + add_batch_size, n_vectors)
         batch = read_features_slice(start, end)
-        faiss.normalize_L2(batch)
         index.add(batch)
         del batch
 
@@ -622,15 +626,15 @@ def upload_results(r2: R2Client, features_prefix: str, reporter: StatusReporter)
 # Step 6: Upload logs & Self-Destruct
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _detect_instance_id(r2: R2Client, features_prefix: str) -> str:
+def _detect_instance_id(r2: R2Client, city_name: str) -> str:
     """Detect our instance ID from R2 or env."""
     instance_id = os.environ.get("INSTANCE_ID", "")
     if instance_id:
         return instance_id
 
-    # Try R2 lookup
+    # Try R2 flat lookup
     try:
-        data = r2.download_json(f"Status/{features_prefix}/builder_instance.json")
+        data = r2.download_json(f"Status/INDEX_{city_name}_lookup.json")
         if data and 'instance_id' in data:
             return str(data['instance_id'])
     except Exception:
@@ -654,35 +658,30 @@ def _detect_instance_id(r2: R2Client, features_prefix: str) -> str:
     return ""
 
 
-def upload_logs(r2: R2Client, features_prefix: str, log_path: Path):
-    """Upload the full instance log to R2."""
-    if not log_path.exists():
-        print("[WARN] No log file to upload")
-        return
-
-    r2_key = f"Logs/{'/'.join(features_prefix.rstrip('/').split('/')[1:])}/builder.log"
-    size_mb = log_path.stat().st_size / (1024 * 1024)
-    print(f"Uploading instance log ({size_mb:.2f} MB) -> {r2_key}")
-
-    for attempt in range(3):
-        success = r2.upload_file(str(log_path), r2_key)
-        if success:
-            print(f"Log uploaded to {r2_key}")
-            return
-        print(f"[RETRY] Log upload attempt {attempt+1} failed")
-        time.sleep(2 ** attempt)
-
-    print("[WARN] Failed to upload log after 3 attempts")
+    # Log uploads to R2 removed — logs stay local for SSH debugging
 
 
-def self_destruct(r2: R2Client, features_prefix: str):
+def _cleanup_status(r2: R2Client, city_name: str, instance_id: str):
+    """Delete the status and lookup files from R2 after completion."""
+    status_key = f"Status/INDEX_{city_name}_{instance_id}.json"
+    lookup_key = f"Status/INDEX_{city_name}_lookup.json"
+    for key in [status_key, lookup_key]:
+        try:
+            r2.delete_file(key)
+            print(f"[CLEANUP] Deleted {key}")
+        except Exception as e:
+            print(f"[WARN] Failed to delete {key}: {e}")
+
+
+def self_destruct(r2: R2Client, city_name: str, instance_id: str):
     """Destroy this instance via vastai CLI."""
     api_key = os.environ.get("VAST_API_KEY", "")
     if not api_key:
         print("[WARN] No VAST_API_KEY — cannot self-destruct")
         return
 
-    instance_id = _detect_instance_id(r2, features_prefix)
+    if not instance_id:
+        instance_id = _detect_instance_id(r2, city_name)
     if not instance_id:
         print("[WARN] Could not detect instance ID — cannot self-destruct")
         return
@@ -764,9 +763,12 @@ def main():
     print(f"Work dir: {WORK_DIR}")
     print(f"CPU cores: {os.cpu_count()} (OMP_NUM_THREADS={_ncpu})")
 
-    # Init R2
+    # Init R2 and detect instance ID
     r2 = R2Client()
-    reporter = StatusReporter(r2, features_prefix)
+    instance_id = _detect_instance_id(r2, city_name)
+    print(f"Instance ID: {instance_id or '(unknown)'}")
+
+    reporter = StatusReporter(r2, city_name, instance_id)
     reporter.report("init", "Starting builder pipeline", 0)
 
     try:
@@ -798,22 +800,22 @@ def main():
         import traceback
         traceback.print_exc()
 
-        # Upload log before pausing
         tee.stop()
-        upload_logs(r2, features_prefix, log_path)
-
         print("[INFO] Container kept alive for debugging. SSH in to investigate.")
         sys.stdout.flush()
         import signal
         signal.pause()
         return
 
-    # Upload full instance log
     tee.stop()
-    upload_logs(r2, features_prefix, log_path)
+
+    # Wait for monitor to pick up COMPLETED, then clean up
+    print("[INFO] Waiting 30s for monitor to see COMPLETED status...")
+    time.sleep(30)
+    _cleanup_status(r2, city_name, instance_id)
 
     # Step 6: Self-destruct
-    self_destruct(r2, features_prefix)
+    self_destruct(r2, city_name, instance_id)
 
 
 if __name__ == "__main__":
